@@ -1,0 +1,268 @@
+pipeline {
+    agent any
+    
+    environment {
+        APP_NAME = 'spring-petclinic'
+        DOCKER_IMAGE = "neirezcher/${APP_NAME}"
+        VERSION = "${env.BUILD_ID}"
+    }
+    
+    tools{
+        maven 'Maven 3.9.9'
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main', 
+                url: 'https://github.com/neirezcher/spring-petclinic.git'
+            }
+        }
+        
+        stage('Build and Test') {
+            steps {
+                sh 'mvn clean package'
+            }
+            
+            post {
+                success {
+                    archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+                    junit 'target/surefire-reports/*.xml'
+                }
+            }
+        }
+        
+        stage('Build Docker Images') {
+            steps {
+                script {
+                    docker.build("${DOCKER_IMAGE}:${VERSION}")
+                }
+            }
+        }
+        
+        stage('Push Docker Images') {
+            steps {
+                script {
+                    docker.withRegistry('https://registry.hub.docker.com', 'DockerHub') {
+                        docker.image("${DOCKER_IMAGE}:${VERSION}").push()
+                        docker.image("${DOCKER_IMAGE}:${VERSION}").push('latest')
+                    }
+                }
+            }
+        }
+        
+        stage('Generate Kubernetes Manifests') {
+            steps {
+                script {
+                    sh 'mkdir -p k8s'
+                    
+                    // Modified to use default namespace
+                    writeFile file: 'k8s/deployment.yaml', text: """
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${APP_NAME}
+  labels:
+    app: ${APP_NAME}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ${APP_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${APP_NAME}
+    spec:
+      containers:
+      - name: ${APP_NAME}
+        image: ${DOCKER_IMAGE}:${VERSION}
+        ports:
+        - containerPort: 8080
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: "mysql"
+        - name: SPRING_DATASOURCE_URL
+          value: "jdbc:mysql://mysql-service/petclinic"
+        - name: SPRING_DATASOURCE_USERNAME
+          value: "petclinic"
+        - name: SPRING_DATASOURCE_PASSWORD
+          value: "petclinic"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        readinessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8080
+          initialDelaySeconds: 45
+          periodSeconds: 15
+"""
+                    
+                    writeFile file: 'k8s/service.yaml', text: """
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${APP_NAME}-service
+spec:
+  selector:
+    app: ${APP_NAME}
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+  type: LoadBalancer
+"""
+                    
+                    writeFile file: 'k8s/mysql.yaml', text: """
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.1
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: "root"
+        - name: MYSQL_DATABASE
+          value: "petclinic"
+        - name: MYSQL_USER
+          value: "petclinic"
+        - name: MYSQL_PASSWORD
+          value: "petclinic"
+        ports:
+        - containerPort: 3306
+        volumeMounts:
+        - name: mysql-persistent-storage
+          mountPath: /var/lib/mysql
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+      volumes:
+      - name: mysql-persistent-storage
+        persistentVolumeClaim:
+          claimName: mysql-pv-claim
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-service
+spec:
+  selector:
+    app: mysql
+  ports:
+    - protocol: TCP
+      port: 3306
+      targetPort: 3306
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pv-claim
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+"""
+                }
+            }
+        }
+        
+        stage('Deploy to Kubernetes') {
+            steps {
+                script {
+                    withCredentials([file(credentialsId: 'kubeConfig', variable: 'KUBE_CONFIG')]) {
+                        withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                            // Deploy MySQL with insecure flag
+                            sh "kubectl apply -f k8s/mysql.yaml --insecure-skip-tls-verify"
+                            
+                            // Wait for MySQL with insecure flag
+                            sh """
+                                attempt=0
+                                max_attempts=30
+                                while [ \$attempt -lt \$max_attempts ]; do
+                                    if kubectl get pods -l app=mysql --insecure-skip-tls-verify | grep -q Running; then
+                                        echo "MySQL is running!"
+                                        break
+                                    fi
+                                    echo "Waiting for MySQL to start... (\$((attempt+1))/\$max_attempts)"
+                                    sleep 10
+                                    attempt=\$((attempt+1))
+                                done
+                                
+                                if [ \$attempt -eq \$max_attempts ]; then
+                                    echo "MySQL failed to start within the allotted time"
+                                    exit 1
+                                fi
+                            """
+                            
+                            // Deploy application with insecure flag
+                            sh "kubectl apply -f k8s/deployment.yaml --insecure-skip-tls-verify"
+                            sh "kubectl apply -f k8s/service.yaml --insecure-skip-tls-verify"
+                            
+                            // Check deployment status
+                            sh "kubectl rollout status deployment/${APP_NAME} --insecure-skip-tls-verify"
+                            
+                            // Get service info
+                            sh "kubectl get svc ${APP_NAME}-service --insecure-skip-tls-verify"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo 'Pipeline completed - cleaning up'
+            cleanWs()
+        }
+        failure {
+            echo 'Pipeline failed - sending notification'
+        }
+         success {
+            script {
+                withCredentials([file(credentialsId: 'kubeConfig', variable: 'KUBE_CONFIG')]) {
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        def serviceInfo = sh(
+                            script: "kubectl get svc ${APP_NAME}-service -o wide --insecure-skip-tls-verify",
+                            returnStdout: true
+                        )
+                        echo "Service info:\n${serviceInfo}"
+                    }
+                }
+            }
+        }
+    }
+}
